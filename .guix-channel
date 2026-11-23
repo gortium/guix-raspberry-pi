@@ -1,0 +1,27 @@
+;; This repository is a Guix channel: (rpi kernel) and (rpi firmware) are
+;; modules you import, with no -L plumbing and no file copying.
+;;
+;; THE DEPENDENCY IS NOT OPTIONAL. Those modules import (nongnu packages linux)
+;; — linux-firmware, which carries the radio firmware — so the channel cannot be
+;; COMPILED without nonguix in the graph. Declaring it here means `guix pull' and
+;; `guix time-machine' fetch it at this exact commit; a channel whose modules
+;; import an undeclared channel fails during the checkout with
+;; "no code for module (nongnu packages linux)".
+;;
+;; Written as DATA, not as a (make-channel-introduction …) call: a dependency is
+;; read with `read' and parsed by `sexp->channel-introduction', which accepts
+;; only this shape. A call form stops guix with "channel dependency has an
+;; invalid introduction field", and a quoted name fails on symbol->string.
+(channel
+ (version 0)
+ (dependencies
+  (channel
+   (name nonguix)
+   (url "https://gitlab.com/nonguix/nonguix.git")
+   (branch "master")
+   (commit "6c2d4c89947e4fa381c896a204ee6bc5e81a7b8d")
+   (introduction
+    (channel-introduction
+     (version 0)
+     (commit "897c1a470da759236cc11798f4e0a5f7d4d59fbc")
+     (signer "2A39 3FFF 68F4 EF7A 3D29  12AF 6F51 20A0 22FB B2D5"))))))

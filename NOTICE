@@ -1,0 +1,55 @@
+NOTICE — provenance of the contents of this repository
+======================================================
+
+This repository is a Guix channel. Most of what it contains is code written for
+it; the parts that come from elsewhere are listed here, with their licence.
+
+
+Kernel source (rpi/kernel.scm)
+------------------------------
+
+The kernel is the Raspberry Pi downstream tree, fetched as a release tarball:
+
+  https://github.com/raspberrypi/linux  tag stable_20250916  (Linux 6.12.47)
+
+That tree is GPL-2.0-only. It is fetched, never vendored: no kernel source is
+stored in this repository, and no patch is applied here — a board that needs one
+passes its own patch list to the constructor and carries those patches itself.
+
+The Guix package code around it (rpi/kernel.scm, rpi/firmware.scm,
+rpi/image.scm, rpi/bootloader.scm, rpi-boot-populate) is GPL-3.0-or-later, like
+the rest of this repository. See LICENSE.
+
+
+Firmware (rpi/firmware.scm)
+---------------------------
+
+Three items are installed from other projects. None of them is redistributed
+here: each package fetches or copies from its own source at build time.
+
+  brcmfmac43455 files       extracted from linux-firmware
+                            (https://git.kernel.org/pub/scm/linux/kernel/git/
+                            firmware/linux-firmware.git), whose licence is the
+                            per-file one; the Broadcom blobs are non-free and are
+                            distributed for use with the hardware they ship with.
+                            linux-firmware is provided by the nonguix channel,
+                            not by Guix.
+
+  BCM4345C0.hcd             https://github.com/RPi-Distro/bluez-firmware,
+                            Broadcom Bluetooth firmware, non-free, same terms.
+
+  regulatory.db(.p7s)       wireless-regdb
+                            (https://git.kernel.org/pub/scm/linux/kernel/git/
+                            linville/wireless-regdb.git), ISC-like licence; the
+                            file is generated from db.txt by a free tool.
+
+Because of these three, the channel declares nonguix as a dependency. A
+repository that carried them itself would be redistributing non-free blobs;
+this one only points at their sources.
+
+
+Boot template (rpi/boot/config.txt)
+-----------------------------------
+
+Written for this channel from the documented behaviour of the Raspberry Pi
+firmware. No vendor file is copied into it.

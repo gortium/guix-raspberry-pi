@@ -1,0 +1,337 @@
+#!/usr/bin/env bash
+# rpi-boot-populate — fill a mounted Raspberry Pi boot partition so the
+# firmware can load a kernel directly. No image surgery, no loop mount, no
+# root: mount the FAT (or point at any directory that stands in for it) and
+# run this.
+#
+# It is the only writer of the three files the firmware reads:
+#
+#   kernel<name>.img      the payload, named after the kernel's page size
+#   initrd.img            the initrd, loaded right after the kernel
+#   config.txt            the platform template, plus `kernel=` and
+#                         `initramfs initrd.img followkernel`
+#   cmdline.txt           root= by bare label and the Guix profile paths
+#
+# Everything it writes it writes in one pass, from one kernel store path, and
+# it exits non-zero with an explicit message when a payload is missing — so a
+# card is never reported as ready while a file the firmware needs is absent.
+# See docs/boot-chain.org for what each file is for and what breaks silently
+# when it is wrong.
+#
+# Usage:
+#   rpi-boot-populate [options] DEST KERNEL
+#
+#     DEST                 mounted boot partition (a directory)
+#     KERNEL               store output of a Linux kernel package: the
+#                          directory that contains Image and dtbs/
+#
+# Options:
+#   --page-size 4k|16k     page size of that kernel; decides the firmware file
+#                          name (4k -> kernel8.img, 16k -> kernel_2712.img).
+#                          Default: 4k.
+#   --initrd FILE|DIR      initrd to install as initrd.img. Required: root= is
+#                          a bare label, and only the initrd resolves it. A
+#                          directory is accepted when it holds exactly one file:
+#                          the store output named by the system's boot
+#                          parameters is a directory (/gnu/store/<hash>-raw-initrd,
+#                          holding initrd.cpio.gz), not the file.
+#   --console SPEC         kernel console, e.g. ttyAMA0,115200 or ttyGS0,115200.
+#                          May be repeated. Without it the kernel has no
+#                          console at all, which looks like a kernel that
+#                          never started.
+#   --root-label NAME      label of the root file system. Default: guix-root.
+#   --config FILE          config.txt template. Default: rpi/boot/config.txt
+#                          next to this script.
+#   --config-extra FILE    board-specific config.txt section (the carrier's
+#                          overlays, GPIO levels, USB role), not a full template.
+#   --dtbs DIR             base device trees. Default: the kernel's
+#                          dtbs/broadcom if present, else its dtbs/.
+#   --overlays DIR         overlay blobs. Default: the kernel's dtbs/overlays.
+#   --firmware DIR         VideoCore blobs (start*.elf, fixup*.dat,
+#                          bootcode.bin), copied to the partition root; needed
+#                          only when the boot EEPROM does not already carry
+#                          them.
+#   -h, --help             this text.
+#
+# Exit status: 0 on success, 2 on a missing input or bad usage.
+
+set -euo pipefail
+
+prog=$(basename "$0")
+# The script reads its own header for --help and finds the template relative to
+# itself, so it must know where it lives even when invoked through $PATH.
+self=$(readlink -f "$0" 2>/dev/null || true)
+[ -n "${self:-}" ] && [ -r "$self" ] || self=$(command -v -- "$0" 2>/dev/null || printf '%s' "$0")
+
+die() {
+  printf '%s: error: %s\n' "$prog" "$*" >&2
+  exit 2
+}
+
+warn() {
+  printf '%s: warning: %s\n' "$prog" "$*" >&2
+}
+
+usage() {
+  if [ -r "$self" ]; then
+    sed -n '/^# Usage:/,/^# Exit status:/p' "$self" | sed 's/^# \{0,1\}//'
+  else
+    printf 'usage: %s [options] DEST KERNEL\n' "$prog"
+  fi
+}
+
+page_size=4k
+initrd=
+firmware=
+template=
+dtbs=
+overlays=
+root_label=guix-root
+config_extra=
+consoles=()
+positional=()
+
+while [ $# -gt 0 ]; do
+  case $1 in
+    -h|--help)
+      usage
+      exit 0 ;;
+    --page-size|--initrd|--console|--root-label|--config|--config-extra|--dtbs|--overlays|--firmware)
+      [ $# -ge 2 ] || die "$1 needs an argument (try --help)"
+      case $1 in
+        --page-size)  page_size=$2 ;;
+        --initrd)     initrd=$2 ;;
+        --console)    consoles+=("$2") ;;
+        --root-label) root_label=$2 ;;
+        --config)     template=$2 ;;
+        --config-extra) config_extra=$2 ;;
+        --dtbs)       dtbs=$2 ;;
+        --overlays)   overlays=$2 ;;
+        --firmware)   firmware=$2 ;;
+      esac
+      shift 2 ;;
+    --)
+      shift
+      break ;;
+    -*)
+      die "unknown option: $1 (try --help)" ;;
+    *)
+      positional+=("$1")
+      shift ;;
+  esac
+done
+
+if [ ${#positional[@]} -ne 2 ]; then
+  usage >&2
+  die "expected exactly two arguments: DEST KERNEL (got ${#positional[@]})"
+fi
+
+dest=${positional[0]}
+kernel=${positional[1]}
+
+# --- the firmware name is a function of the page size ----------------------
+# A 4K kernel is loaded from kernel8.img and a 16K kernel from
+# kernel_2712.img. These are the only two names the 2712 firmware accepts for
+# a direct boot; the names are not interchangeable and a wrong one is not an
+# error the firmware reports.
+case $page_size in
+  4k|4096)   kernel_name=kernel8.img ;;
+  16k|16384) kernel_name=kernel_2712.img ;;
+  *) die "unknown page size '$page_size' (expected 4k or 16k)" ;;
+esac
+
+# --- inputs ---------------------------------------------------------------
+[ -d "$dest" ] || die "boot partition not found: $dest — mount the FAT partition and pass its mount point"
+[ -w "$dest" ] || die "boot partition is not writable: $dest"
+
+[ -d "$kernel" ] || die "no kernel output at $kernel — pass the store output of a Linux kernel package, the directory that holds Image and dtbs/"
+[ -f "$kernel/Image" ] || die "kernel image missing: no $kernel/Image — the firmware loads an uncompressed arm64 Image, never a zImage or a vmlinuz, so a kernel package without Image cannot boot this board"
+
+[ -n "$initrd" ] || die "no initrd given (--initrd FILE) — cmdline.txt names root= by label, and only the initrd can resolve a label to a device"
+# A store output is a directory, and the one the system declares is
+# /gnu/store/<hash>-raw-initrd: a directory holding initrd.cpio.gz AND the
+# `references' file guix writes next to every output. Counting all files would
+# make every real store path fail, so the metadata is ignored and an initrd-named
+# file is preferred.
+if [ -d "$initrd" ]; then
+  mapfile -t initrd_files < <(find "$initrd" -maxdepth 1 -type f \
+    ! -name references ! -name '.attrs' ! -name 'deriver' 2>/dev/null | sort)
+  case ${#initrd_files[@]} in
+    0)
+      die "initrd directory $initrd holds no initrd — expected one file, e.g. initrd.cpio.gz" ;;
+    1)
+      initrd=${initrd_files[0]} ;;
+    *)
+      # More than one non-metadata file: accept it only if exactly one is named
+      # like an initrd, so the choice is still not a guess.
+      mapfile -t named < <(printf '%s\n' "${initrd_files[@]}" | grep -E '/(initrd|initramfs)')
+      if [ "${#named[@]}" -eq 1 ]; then
+        initrd=${named[0]}
+      else
+        die "initrd directory $initrd holds ${#initrd_files[@]} files ($(basename -a "${initrd_files[@]}" | paste -sd' ' -)) — expected one; pass the initrd file itself"
+      fi ;;
+  esac
+fi
+[ -f "$initrd" ] || die "initrd not found: $initrd"
+
+if [ -z "$template" ]; then
+  template=$(dirname "$self")/rpi/boot/config.txt
+fi
+[ -f "$template" ] || die "config.txt template not found: $template"
+if [ -n "$config_extra" ]; then
+  [ -f "$config_extra" ] || die "board config.txt section not found: $config_extra"
+fi
+
+if [ -z "$dtbs" ]; then
+  if [ -d "$kernel/dtbs/broadcom" ]; then
+    dtbs=$kernel/dtbs/broadcom
+  else
+    dtbs=$kernel/dtbs
+  fi
+fi
+
+if [ -z "$overlays" ]; then
+  for candidate in "$kernel/dtbs/overlays" "$dtbs/overlays"; do
+    if [ -d "$candidate" ]; then
+      overlays=$candidate
+      break
+    fi
+  done
+fi
+
+# The board device tree is not optional. The firmware resolves it from the
+# boot partition before it ever looks at the kernel, and with none present it
+# stops without writing a single line anywhere.
+mapfile -t dtb_files < <(find "$dtbs" -maxdepth 1 -type f -name '*.dtb' 2>/dev/null | sort)
+if [ ${#dtb_files[@]} -eq 0 ]; then
+  die "no device tree blob (*.dtb) in $dtbs — the firmware resolves the board device tree from the boot partition and stops before the kernel without it"
+fi
+
+dtbo_files=()
+if [ -n "$overlays" ] && [ -d "$overlays" ]; then
+  mapfile -t dtbo_files < <(find "$overlays" -maxdepth 1 -type f -name '*.dtbo' 2>/dev/null | sort)
+else
+  warn "no overlays directory next to the device trees; the card will carry no overlay, so any board whose display, audio or USB role comes from an overlay will not have it"
+fi
+
+# --- config.txt: template, then the two names this run installs, then board --
+# Any kernel=/initramfs line left in the template or in the board file is
+# dropped and reported. A second copy is how a card once ended up with one name
+# in config.txt and another on the partition.
+#
+# ORDER IS THE POINT. `kernel=' and `initramfs' come BEFORE the board section,
+# not after it: a board file ends inside a conditional section ([pi5], [pi4]),
+# and a line written after that section belongs to it — the firmware then
+# ignores kernel= on every other SoC, and a card with two payloads silently
+# boots whatever the previous config.txt named. For the same reason the section
+# the file is in is closed before those lines: a template that ends inside a
+# section would otherwise capture them exactly the same way.
+staged=$(mktemp -d)
+trap 'rm -rf "$staged"' EXIT
+
+# Name of the last section header in FILE, empty when the file has none.
+last_section() {
+  sed -n 's/^[[:space:]]*\[\([^]]*\)\].*$/\1/p' "$1" | tail -n 1
+}
+
+# True when FILE's first non-blank, non-comment line is a section header.
+starts_with_section() {
+  sed -e 's/^[[:space:]]*//' -e '/^$/d' -e '/^#/d' "$1" | head -n 1 | grep -qE '^\[[^]]+\]'
+}
+
+if grep -qE '^[[:space:]]*(kernel=|initramfs[[:space:]])' "$template"; then
+  warn "template $template declares kernel= or initramfs; ignoring it, this tool owns both lines"
+fi
+grep -vE '^[[:space:]]*(kernel=|initramfs[[:space:]])' "$template" \
+  > "$staged/config.txt" || true
+
+section=$(last_section "$staged/config.txt")
+if [ -n "$section" ] && [ "$section" != all ]; then
+  printf '\n[all]\n' >> "$staged/config.txt"
+fi
+printf 'kernel=%s\ninitramfs initrd.img followkernel\n' "$kernel_name" \
+  >> "$staged/config.txt"
+
+# Board half, if given: after the platform defaults and after kernel=, so its
+# [all]/[pi5] lines override the platform settings and cannot capture the two
+# lines this tool owns. Stripped of kernel=/initramfs like the template, for
+# one owner; and made to start at a section header, so its first settings are
+# not silently appended to whatever section the template ended in.
+if [ -n "$config_extra" ]; then
+  printf '\n' >> "$staged/config.txt"
+  if ! starts_with_section "$config_extra"; then
+    printf '[all]\n' >> "$staged/config.txt"
+  fi
+  grep -vE '^[[:space:]]*(kernel=|initramfs[[:space:]])' "$config_extra" \
+    >> "$staged/config.txt" || true
+fi
+
+# --- cmdline.txt ---------------------------------------------------------
+# root= is a bare label, never LABEL= and never a device node: the Guix initrd
+# parses the label itself. gnu.system and gnu.load point at the profile, not at
+# a store path, so `guix system reconfigure' on the card takes effect at the
+# next boot without touching this partition. Both are mandatory — with no
+# gnu.load the initrd prints one line about it, opens a REPL and the system
+# never starts.
+cmdline=
+for console in ${consoles[@]+"${consoles[@]}"}; do
+  cmdline+="console=$console "
+done
+cmdline+="root=$root_label rootfstype=ext4 rootwait rw"
+cmdline+=" gnu.system=/var/guix/profiles/system"
+cmdline+=" gnu.load=/var/guix/profiles/system/boot"
+
+case $cmdline in
+  *"$root_label"*) ;;
+  *) die "internal: root label lost from the cmdline" ;;
+esac
+case $cmdline in
+  */gnu/store/*)
+    die "cmdline would contain a store path ($cmdline) — paths on the boot partition are pinned to one generation and stop matching after the next reconfigure; the profile paths are the only supported form" ;;
+esac
+printf '%s\n' "$cmdline" > "$staged/cmdline.txt"
+
+# --- install -------------------------------------------------------------
+echo "populating $dest"
+install -m 644 "$kernel/Image" "$dest/$kernel_name"
+install -m 644 "$initrd"       "$dest/initrd.img"
+install -m 644 "${dtb_files[@]}" "$dest/"
+
+mkdir -p "$dest/overlays"
+if [ ${#dtbo_files[@]} -gt 0 ]; then
+  install -m 644 "${dtbo_files[@]}" "$dest/overlays/"
+fi
+
+if [ -n "$firmware" ]; then
+  [ -d "$firmware" ] || die "firmware directory not found: $firmware"
+  blobs=()
+  for pattern in '*.elf' '*.dat' 'bootcode.bin'; do
+    while IFS= read -r blob; do
+      [ -n "$blob" ] && blobs+=("$blob")
+    done < <(find "$firmware" -maxdepth 1 -type f -name "$pattern" | sort)
+  done
+  [ ${#blobs[@]} -gt 0 ] || die "no VideoCore blob (*.elf, *.dat, bootcode.bin) in $firmware"
+  install -m 644 "${blobs[@]}" "$dest/"
+  echo "  firmware blobs: ${#blobs[@]} file(s) from $firmware"
+fi
+
+# Drop a kernel left under the other name by an earlier run at another page
+# size. It is never loaded, and its presence is what makes a wrong config.txt
+# look like a working card.
+for stale in "$dest"/kernel*.img; do
+  [ -e "$stale" ] || continue
+  [ "$(basename "$stale")" = "$kernel_name" ] && continue
+  rm -f "$stale"
+  echo "  removed stale $(basename "$stale")"
+done
+
+install -m 644 "$staged/config.txt"  "$dest/config.txt"
+install -m 644 "$staged/cmdline.txt" "$dest/cmdline.txt"
+
+echo "  $kernel_name, initrd.img, config.txt, cmdline.txt"
+echo "  ${#dtb_files[@]} base device tree(s), ${#dtbo_files[@]} overlay(s) -> overlays/"
+echo "--- cmdline.txt ---"
+cat "$dest/cmdline.txt"
+echo "--- config.txt: kernel lines ---"
+grep -nE '^[[:space:]]*(kernel=|initramfs[[:space:]])' "$dest/config.txt"
+echo "OK: $dest is ready for a direct-kernel boot of $kernel_name"

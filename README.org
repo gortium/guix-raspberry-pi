@@ -1,0 +1,268 @@
+#+TITLE: guix-raspberry-pi
+#+SUBTITLE: A Guix channel for 64-bit Raspberry Pi boards
+#+OPTIONS: toc:2 num:nil
+
+* What this is
+
+This is a Guix channel that provides the Raspberry Pi downstream kernel
+(=rpi-6.12.y=) as a parameterised package, the direct-kernel boot chain the
+firmware reads, and the firmware a board's radio needs. It covers two SoCs:
+=bcm2711= (Pi 4, CM4) and =bcm2712= (Pi 5, CM5). Boards consume it as a
+channel and add what is theirs — patches, overlays, a system, an image — so
+nothing in this repository describes a particular product.
+
+* Status
+
+One SoC has been run on real hardware; the other has not. That difference is
+the most useful thing this document says, so it comes before any feature list.
+
+| SoC           | boards             | status                                                     |
+|---------------+--------------------+------------------------------------------------------------|
+| =bcm2712=     | Pi 5, CM5          | *proven on hardware*: boots a system to a login prompt     |
+| =bcm2711=     | Pi 4, CM4          | *expected, not tested*: evaluates and builds, never flashed  |
+| 32-bit family | Pi 3, Zero, Pi 1/2 | *out of scope*: different architecture and boot chain       |
+
+What each of those means:
+
+- *Proven* — the 4 KiB kernels (xz, zstd, and zstd with the USB serial
+  console), the boot-partition writer, and a system that comes up to a login
+  prompt on the file-system labels the image sets, all exercised on a CM5.
+  The 16 KiB build evaluates and builds, but it *did not come up* on that
+  carrier: 16 KiB is the SoC's default page size, not a page size this board
+  was observed booting.
+- *Expected* — the same constructor, the same boot chain, the same firmware
+  packages; only the defconfig and the default page size change. The
+  derivation builds, the device trees land under =dtbs/=, and the example
+  system resolves. The ten minutes after power-on have not been checked, so
+  treat it as a starting point, not a tested image.
+- *Out of scope* — Pi 3 and the Zero family boot a 32-bit kernel through
+  u-boot: a different architecture, defconfig and boot chain, so adding them
+  is a second boot path rather than a parameter. Upstream Guix's
+  =raspberry-pi.scm= image is where those boards start.
+
+*What has changed since that hardware run.* The working port was one
+repository; publishing it split the reusable machinery from the board that uses
+it, and parameterised the kernel constructor. The published tree therefore
+produces a *different derivation* from the one that booted, from the *same*
+source tarball, the *same* patch set and the *same* =.config= lines in the same
+order — a package's arguments embed the text of its builder, so any refactor of
+that builder changes the hash even when the kernel it builds does not.
+
+The consequence is honest and worth stating plainly: this exact tree has been
+evaluated, built and compared, not flashed. The first person to flash it is
+testing it. The board that this channel was written for carries the measured
+record of what the previous build did, and that record is what the status column
+above describes.
+
+A kernel's file name follows its page size and nothing else: the 2712
+firmware accepts a 16 KiB kernel only when it is named =kernel_2712.img=, and
+a 4 KiB kernel as =kernel8.img=. The two names are not interchangeable and a
+wrong one produces a board that never reaches the kernel with nothing on any
+console.
+
+The details — defconfigs, file names, why 16 KiB is refused on =bcm2711=
+rather than silently downgraded, what =expected= is worth — are in
+[[file:docs/boards.org][docs/boards.org]], which is the long version of this
+table.
+
+* How to use it
+
+** What the channel exports
+
+| module or file             | what it is                                                    |
+|----------------------------+---------------------------------------------------------------|
+| =(rpi kernel)=             | =make-linux-rpi=, the parameterised constructor, and the variants it derives |
+| =(rpi firmware)=           | WiFi blob a kernel without zstd decompression can use, Bluetooth =hcd=, =regulatory.db= |
+| =(rpi image)=              | =rpi-image=, the one disk-image constructor: FAT boot partition + ext4 root |
+| =(rpi bootloader)=         | =%direct-kernel-bootloader=, the no-op bootloader record a directly booted system declares |
+| =rpi-boot-populate=        | the writer of the boot FAT: kernel, initrd, =config.txt=, =cmdline.txt= |
+| =rpi/boot/config.txt=      | the platform half of the firmware configuration               |
+| =examples/system-cm5.scm=  | a CM5 that boots to a login prompt (=cm5-system=)              |
+| =examples/system-pi4.scm=  | the same for a Pi 4 / CM4                                      |
+| =examples/image-cm5=       | the disk image for =cm5-system=                                |
+
+The kernel variants come from one constructor: =linux-rpi= (16 KiB pages, xz
+modules), =linux-rpi-4k=, =linux-rpi-4k-zstd=, =linux-rpi-4k-zstd-console=, and
+the =linux-rpi-2711…= family for =bcm2711=. A board adds patches and kconfig
+lines as arguments; it does not copy the build.
+
+** Pin the channels
+
+=channels=, with every channel at a commit. The =guix= and =nonguix= pins
+below are the ones this tree is developed against, and the nonguix commit is
+the one =.guix-channel= declares; the platform pin is whatever commit you mean
+to test.
+
+The file is called =channels=, with no =.scm= extension, and that is not a
+style choice: this repository is a channel, so every =.scm= file under its
+module root is compiled as a module when the channel is fetched. A
+=channels.scm= here would be compiled too, and =(list (channel …))= has no
+binding for =channel= at compile time — the checkout dies with "Unbound
+variable: channel" before any of this is usable (see the three traps below).
+
+#+begin_src scheme
+(list (channel
+       (name 'guix)
+       (url "https://git.guix.gnu.org/guix.git")
+       (branch "master")
+       (commit "de069958fcf9050be92a4085c31b9738ca4ff912")
+       (introduction
+        (make-channel-introduction
+         "9edb3f66fd807b096b48283debdcddccfea34bad"
+         (openpgp-fingerprint
+          "BBB0 2DDF 2CEA F6A8 0D1D  E643 A2A0 6DF2 A33A 54FA"))))
+      (channel
+       (name 'nonguix)
+       (url "https://gitlab.com/nonguix/nonguix.git")
+       (branch "master")
+       (commit "6c2d4c89947e4fa381c896a204ee6bc5e81a7b8d"))
+      (channel
+       (name 'guix-raspberry-pi)
+       (url "https://github.com/<account>/guix-raspberry-pi.git")
+       (branch "main")
+       (commit "<40-character commit>")))
+#+end_src
+
+While working on a local checkout, replace the URL with
+=file:///path/to/checkout= and the commit with the one you are testing.
+
+** Kernel variants
+
+Ask for derivations first; nothing is built.
+
+#+begin_src shell
+guix time-machine --channels=channels -- \
+  build --system=aarch64-linux -d \
+  -e '(list (@ (rpi kernel) linux-rpi)
+            (@ (rpi kernel) linux-rpi-4k)
+            (@ (rpi kernel) linux-rpi-4k-zstd)
+            (@ (rpi kernel) linux-rpi-4k-zstd-console))'
+#+end_src
+
+Then build the one the board needs:
+
+#+begin_src shell
+guix time-machine --channels=channels -- \
+  build --system=aarch64-linux \
+  -e '(@ (rpi kernel) linux-rpi-4k-zstd-console)'
+#+end_src
+
+=--system= is only necessary when the build host is not aarch64. The chain
+works cross-compiled and natively; no build variable is pinned to one of them.
+
+** The reference system
+
+#+begin_src shell
+guix time-machine --channels=channels -- \
+  system build --system=aarch64-linux --dry-run \
+  -e '(@ (examples system-cm5) cm5-system)'
+#+end_src
+
+For a Pi 4 or CM4, =examples/system-pi4.scm= holds the equivalent bcm2711
+system: same constructor, same labels, its own kernel variant and
+=initrd-modules=. Both examples are modules, and =system-cm5.scm= also names
+its system (=cm5-system=), which is what makes the image example and the
+command above possible.
+
+** An image
+
+=guix system image= puts a system on a disk; =rpi-image= is what decides the
+layout, so the image is built by applying it to the reference system:
+
+#+begin_src shell
+guix time-machine --channels=channels -- \
+  system image --system=aarch64-linux --dry-run \
+  -e '((@ (rpi image) rpi-image)
+       #:os (@ (examples system-cm5) cm5-system))'
+#+end_src
+
+Drop =--dry-run= to write the image. =examples/image-cm5= is the same image as
+a file, for a checkout of this repository:
+=guix system image --system=aarch64-linux -L . examples/image-cm5=.
+
+The result has one FAT partition (512 MiB, MBR type =0x0c=, flag =boot= and
+deliberately not =esp=) and one ext4 root, and *the boot partition is empty*:
+no kernel, no initrd, no =config.txt=. It is a card layout, not a bootable
+card.
+
+** Fill the boot partition
+
+Flash the image, mount the FAT partition, and let the writer place the payload:
+
+#+begin_src shell
+sudo ./rpi-boot-populate /mnt/boot /gnu/store/<hash>-linux-rpi-4k-zstd-console \
+  --page-size 4k \
+  --initrd /gnu/store/<hash>-raw-initrd \
+  --console ttyGS0,115200
+#+end_src
+
+=--initrd= takes the initrd *store output*, which is a directory:
+=/gnu/store/<hash>-raw-initrd= holds one file, =initrd.cpio.gz=. The tool
+resolves the single regular file inside it and installs that as =initrd.img=;
+it stops with an error if the directory is empty or holds more than one file,
+rather than guessing. The file itself
+(=/gnu/store/<hash>-raw-initrd/initrd.cpio.gz=) is equally acceptable.
+
+The tool copies the kernel under the name the firmware's page size expects,
+installs the base device trees in the partition root and the overlays under
+=overlays/=, writes =config.txt= and =cmdline.txt= from one set of arguments,
+and puts =kernel=/=initramfs= before any board section so they apply whatever
+SoC the firmware reports. Why each of those files matters, and which mistakes
+fail with no message at all, is in
+[[file:docs/boot-chain.org][docs/boot-chain.org]].
+
+* Three things that break a channel, and why
+
+- *A =.scm= file at the module root is compiled as a module.* Scripts and data
+  files carry no extension (=channels=, =rpi-boot-populate=), because Guix
+  compiles every =.scm= it finds under the module root and a script that is not
+  a module dies there with "Unbound variable: channel".
+- *A channel dependency in =.guix-channel= is data, not code.* It is read with
+  =read= and parsed by =sexp->channel-introduction=: so =(name nonguix)=
+  unquoted (a quoted symbol fails on =symbol->string=), and the introduction in
+  the =(channel-introduction (version 0) (commit …) (signer …))= form — a
+  =(make-channel-introduction …)= call stops guix with "channel dependency has
+  an invalid introduction field".
+- *Every imported file needs a =define-module=.* A system file without one
+  fails at channel-compile time with "no code for module", not when the system
+  is built.
+
+The consequence of all three is one rule: *a channel whose modules import
+another channel must declare it*. =(rpi firmware)= imports =(nongnu packages
+linux)= for =linux-firmware=, so nonguix is declared in =.guix-channel= at a
+pinned commit. Without that declaration the checkout fails with "no code for
+module (nongnu packages linux)" — the channel never compiles, so nothing
+downstream can use it.
+
+* Honest costs
+
+- *The first kernel build is a real kernel build.* No public substitute server
+  carries the kernels this channel defines, so =guix build= compiles
+  =rpi-6.12.y= on the machine doing the build. Later builds reuse the store;
+  the reference system does not become cheap on a fresh machine.
+- *zstd modules are not decoration.* Guix's initrd machinery reads =.gz= and
+  =.ko.zst= only (=gnu/build/linux-modules.scm=), so a kernel whose modules are
+  =.ko.xz= cannot be named in =initrd-modules= at all. Any board that needs a
+  driver before the root file system is mounted uses a =…-zstd= variant.
+- *The image ships an empty boot FAT, by design.* The kernel, initrd,
+  =config.txt= and =cmdline.txt= have one writer, =rpi-boot-populate=, and it
+  runs against the mounted partition. An image that also populated them would
+  be a second writer, and the two would drift the first time either changed.
+
+* What this repository deliberately does not contain
+
+- No desktop or session configuration, no window manager, no user dotfiles: a
+  system here is the smallest thing that boots to a login prompt, and what
+  runs on top is the user's choice.
+- No personal setup, no host names, keys or addresses beyond the placeholders
+  in the examples.
+- No board-specific patch, overlay or =config.txt= section. A board — a
+  carrier, an appliance — depends on this channel at a pinned commit and adds
+  its own files; the platform half of =config.txt= stays here and the board
+  appends its section after it.
+- No u-boot or extlinux path. There is one boot chain, described in
+  [[file:docs/boot-chain.org][docs/boot-chain.org]]. The systems here declare
+  =%direct-kernel-bootloader= (=(rpi bootloader)=): no bootloader package, no
+  installer, no configuration file, no menu entries, so nothing writes
+  =/boot/extlinux/extlinux.conf= and there is no second boot configuration to
+  disagree with =config.txt=.

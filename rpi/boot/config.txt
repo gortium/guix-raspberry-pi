@@ -1,0 +1,40 @@
+# Direct-kernel boot: the PLATFORM half of config.txt.
+#
+# This file describes the firmware behaviour that is true of every 64-bit
+# Raspberry Pi 5 class board, and nothing else. What a particular carrier needs
+# — a panel overlay, a USB role, an antenna select, a PCIe state, GPIO levels —
+# belongs to that carrier, either in a section appended after this one (the
+# firmware applies later settings last, so a board section overrides the [all]
+# values below) or in an overlay it supplies.
+#
+# This file carries NO `kernel=` line and NO `initramfs` line, on purpose.
+# Those two names are properties of the payload actually placed on the card,
+# and the tool that places it writes them in the same pass it copies the files
+# (see rpi-boot-populate and docs/boot-chain.org). A copy here is a second
+# source of truth: the template and the card drift, the firmware loads whatever
+# the template names, finds nothing, and falls back to an earlier image on the
+# same partition without reporting an error anywhere.
+#
+# Do not edit the copy on the card. Edit this file and re-run the tool.
+
+[all]
+# The kernel must be the 64-bit one. With arm_64bit=0 the firmware looks for a
+# 32-bit kernel and an arm64 Image is never loaded, however it is named.
+arm_64bit=1
+
+# Primary UART on the GPIO header, plus the firmware's own log on the second
+# stage. Together these are the only output available before the kernel starts
+# on a carrier with no display; a board that needs those pins for something
+# else overrides them in its own section.
+enable_uart=1
+uart_2ndstage=1
+
+# Escape hatch: the Pi 5 firmware checks that the loaded device tree claims this
+# board before starting the kernel, and stops silently when it does not. os_check
+# keeps a device tree mismatch from being indistinguishable from a dead kernel.
+os_check=0
+
+# Framebuffer and overscan defaults. Harmless on a board with no display, and
+# required on any carrier that presents one.
+max_framebuffers=2
+disable_overscan=1

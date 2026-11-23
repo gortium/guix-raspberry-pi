@@ -1,0 +1,76 @@
+#+TITLE: Boards: what is proven, what is expected, what is out of scope
+#+OPTIONS: toc:2 num:nil
+
+This channel builds one kernel constructor and boots it directly from the
+firmware. Two SoCs are in scope, and only one of them has been run on real
+hardware here. That difference matters more than any feature list, so it is the
+first thing this document states.
+
+* Proven on hardware: bcm2712 (Pi 5, CM5)
+
+Everything in the channel has been exercised on a CM5: the 4 KiB kernels (xz,
+zstd, and zstd with the USB serial console), the boot-partition writer, and a
+system that comes up to a login prompt with the labels the image sets.
+
+*16 KiB is not in that list.* The 16 KiB build evaluates and compiles, and the
+2712 firmware accepts such a kernel only when the file is named
+=kernel_2712.img=; on a CM5 it did not come up. 16 KiB is the SoC's default
+page size, which is why the plain =linux-rpi= variant is built that way, not a
+page size this carrier was observed booting. A 4 KiB kernel is =kernel8.img=,
+and that is the pair the boot writer derives from =--page-size=.
+
+| what                      | value                                   |
+|---------------------------+-----------------------------------------|
+| defconfig                 | =bcm2712_defconfig=                      |
+| page size                 | 16384 by default, 4096 on request       |
+| kernel file name          | =kernel_2712.img= (16 KiB), =kernel8.img= (4 KiB) |
+| variants                  | =linux-rpi=, =linux-rpi-4k=, =linux-rpi-4k-zstd=, =linux-rpi-4k-zstd-console= |
+
+* Expected to work, not tested: bcm2711 (Pi 4, CM4)
+
+Same constructor, same phases, same firmware packages; only the defconfig and
+the default page size change. Nothing here has been flashed to a 2711 board, so
+treat it as a starting point that evaluates and builds, not as a tested image.
+The most likely places to need work are a board-specific overlay and the
+command line's console argument — not the kernel build.
+
+| what                      | value                                   |
+|---------------------------+-----------------------------------------|
+| defconfig                 | =bcm2711_defconfig=                      |
+| page size                 | 4096; 16 KiB is refused at evaluation time |
+| kernel file name          | =kernel8.img=                            |
+| variants                  | =linux-rpi-2711=, =linux-rpi-2711-zstd=, =linux-rpi-2711-zstd-console= |
+
+Why 16 KiB is refused rather than silently downgraded: the 2711 defconfig
+selects 4 KiB pages, the Pi 4 firmware loads only =kernel8.img=, and a 16 KiB
+kernel on that board is a board that never starts — indistinguishable from dead
+hardware, with nothing on any console to explain it. A caller that asks for an
+impossible combination gets an error naming the SoC.
+
+Initial RAM disk: the 2711 root device is the emmc2 controller, driven by
+=sdhci-iproc= (built in), and ext4 is built in, so =initrd-modules= can be
+empty on a Pi 4 booting from SD or a CM4 booting from eMMC. =sdhci-of-dwcmshc=
+is RP1's controller and does not exist here; listing it is the kind of line
+that looks right and does nothing. See =examples/system-pi4.scm=.
+
+* Out of scope: Pi 3, Pi Zero, and anything 32-bit
+
+These boards boot a 32-bit kernel through u-boot. That is a different boot
+chain, a different defconfig, and a different architecture, so adding them is
+not a parameter — it is a second boot path. The channel does not pretend to
+cover it; upstream Guix's =raspberry-pi.scm= image is the place to start for
+those boards.
+
+| board family  | why it is not here                        |
+|---------------+-------------------------------------------|
+| Pi 3, Pi 3+   | 32-bit ARM, u-boot boot chain             |
+| Pi Zero, Zero 2 | 32-bit board family; not covered by either defconfig here |
+| Pi 1, Pi 2    | 32-bit, different SoC family              |
+
+* What "expected" is worth
+
+A board listed as expected has been checked at evaluation time: the derivation
+builds, the device trees land under =dtbs/=, the firmware packages install, and
+the example system resolves. What has not been checked is the ten minutes after
+power-on. If you run a 2711 board and it comes up, that is the evidence this
+document is missing.

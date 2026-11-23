@@ -1,0 +1,198 @@
+#+TITLE: The direct-kernel boot chain
+#+SUBTITLE: What the firmware reads, who writes it, and what fails in silence
+#+OPTIONS: toc:2 num:nil
+
+This channel boots a board with no bootloader: the Raspberry Pi firmware starts
+the kernel itself. That removes u-boot from the picture, and puts every
+decision into a handful of files on one FAT partition. Those files have exactly
+one writer, and this document is the reference for what that writer owes the
+firmware.
+
+* The chain, from power to login
+
+1. The boot EEPROM starts the second-stage firmware from the FAT partition.
+2. The firmware reads =config.txt= from the root of that partition.
+3. It reads =cmdline.txt= and passes its content, unchanged, to the kernel as
+   the command line.
+4. It loads the base device tree named by the board identification stored in
+   the EEPROM, then applies every =dtoverlay= from =config.txt=, from the
+   partition's =overlays/= directory.
+5. It loads the kernel image named by =kernel= and, because =initramfs= says
+   =followkernel=, the immediately following payload as the initrd.
+6. The kernel starts, unpacks the initrd, and the Guix initrd reads
+   =root= from the command line, mounts that file system, and executes the
+   boot file named by =gnu.load=.
+
+Step 6 is the part that is easy to get wrong on a card that looks complete:
+with no =root=, the initrd has nowhere to mount; with no =gnu.load=, it prints
+one line, opens a REPL, and the system never starts.
+
+* Who writes what
+
+| file                  | written by        | never edited by hand |
+|-----------------------+-------------------+----------------------|
+| =config.txt=          | template + tool   | yes                  |
+| =cmdline.txt=         | tool              | yes                  |
+| =kernel8.img= or =kernel_2712.img= | tool | yes                  |
+| =initrd.img=          | tool              | yes                  |
+| =*.dtb= (partition root) | tool          | yes                  |
+| =overlays/*.dtbo=     | tool              | yes                  |
+| =start*.elf=, =fixup*.dat=, =bootcode.bin= | tool, optional | no — the EEPROM usually carries them |
+
+The template lives in the channel: =rpi/boot/config.txt=. The tool is
+=rpi-boot-populate=, at the root of the channel.
+
+* One writer, and why that is a rule rather than a preference
+
+=config.txt= in the channel carries the platform half only: =arm_64bit=, the
+UART lines the firmware itself uses, the display defaults, and =os_check=0=.
+It carries no =kernel= and no =initramfs= line.
+
+The tool strips those two lines from the template if they appear, then writes
+them from the payload it is actually installing, in the same pass. The reason
+is a failure that leaves no trace: if the template names one kernel and the
+card carries another, the firmware loads what the template says, finds nothing,
+and boots the previous image still present on the partition. The board comes up
+on an older kernel, the card tests green, and nothing on any console says why.
+
+*=kernel= and =initramfs= are global settings, so the tool writes them before
+any board section.* =config.txt= settings apply from the line that names them
+until the next section header, and a board file ends inside its own section
+(=[pi5]=, =[pi4]=). Appended last, the two lines would belong to that section
+and the firmware would ignore them on every other SoC — a card that boots on
+one board and silently loads nothing on the next. For the same reason the tool
+emits =[all]= before them when the platform template itself ends inside a
+section.
+
+For the same reason the tool removes a kernel left under the other name by an
+earlier run at a different page size. A stale image is worse than no image: it
+turns a wrong =config.txt= into a card that appears to work.
+
+=cmdline.txt= has one owner for the same reason. A system declared with
+=kernel-arguments= would put a second copy in the store, and the copy on the
+FAT would silently disagree with it. The system's kernel arguments are empty on
+purpose.
+
+* The board half of config.txt
+
+A carrier does not copy the template. It passes its own section with
+=--config-extra FILE=, and the tool appends that file after the platform
+template and *after* =kernel=/=initramfs=. The firmware applies later settings
+last, so a section in the board file overrides the platform default with the
+same key, and a =[pi5]= (or =[pi4]=) section only applies on that SoC. A board
+file that does not begin with a section header gets =[all]= emitted in front of
+it, so its first settings cannot be captured by whatever section the template
+ended in.
+
+The board file holds what is true of that carrier and nothing else: its
+overlays, its GPIO levels, its USB role, its antenna select. It cannot declare
+=kernel= or =initramfs= — the tool strips both lines from it, exactly as it
+does for the template, so the payload's name keeps one owner.
+
+#+begin_src shell
+sudo ./rpi-boot-populate /mnt/boot /gnu/store/<hash>-linux-acme-4k-zstd-console \
+  --page-size 4k --initrd /gnu/store/<hash>-raw-initrd \
+  --config-extra /path/to/board/config.txt --console tty1
+#+end_src
+
+=--initrd= names the initrd store output, which is a *directory*
+(=/gnu/store/<hash>-raw-initrd=, holding =initrd.cpio.gz=), not a file. The
+tool installs the single regular file it finds inside it and stops with an
+error when the directory is empty or holds more than one file: a boot partition
+whose =initrd.img= was chosen by guessing is a card that mounts nothing. Passing
+the file itself (=/gnu/store/<hash>-raw-initrd/initrd.cpio.gz=) is the same
+thing and equally supported.
+
+* Device trees and overlays
+
+Two different things, in two different places, both required:
+
+- The *base device tree* — =bcm2712-rpi-5-b.dtb=, =bcm2712-rpi-cm5-cm5io.dtb=
+  and their siblings — goes in the *root* of the FAT partition. The firmware
+  resolves it before it looks at the kernel. With no matching device tree the
+  firmware stops, and a board with no display shows nothing at all.
+- An *overlay* — the =*.dtbo= files — goes in the =overlays/= directory. It
+  patches the base tree after it is loaded, and it is only applied if
+  something asked for it with =dtoverlay=.
+
+The kernel package installs both under its =dtbs/= output: base trees in
+=dtbs/broadcom/=, overlays in =dtbs/overlays/=. The tool copies the first set
+to the partition root and the second into =overlays/=, and refuses to report
+success when it found no base tree at all.
+
+An overlay that is not on the card is not an error the firmware reports. The
+board simply comes up without whatever that overlay provided: no panel, no
+audio, a USB port in the wrong role.
+
+* The kernel name
+
+The 2712 firmware accepts two file names for a directly booted kernel:
+
+| page size | file             |
+|-----------+------------------|
+| 4 KiB     | =kernel8.img=    |
+| 16 KiB    | =kernel_2712.img= |
+
+The name follows the kernel's page size, not its version, not the board, and
+not a preference. The tool derives it from =--page-size= so the name and the
+payload cannot disagree; a kernel is built with one page size and there is no
+configuration in which the other name is correct.
+
+* The command line
+
+=rpi-boot-populate= writes, in this order:
+
+#+begin_src
+[console=<spec> ...] root=<label> rootfstype=ext4 rootwait rw \
+  gnu.system=/var/guix/profiles/system \
+  gnu.load=/var/guix/profiles/system/boot
+#+end_src
+
+- =root=<label>= is a bare label, never =LABEL=<label>= and never a device
+  node: the Guix initrd parses labels itself. The kernel alone would look for
+  =/dev/<label>=, so this form requires the initrd — which is why the tool
+  refuses to run without one.
+- =gnu.system= and =gnu.load= name the *profile*, not a store path. A store
+  path pins the card to one generation and has to be rewritten every time the
+  system is reconfigured; the profile path follows the generation the card
+  actually points at. The tool fails if a store path would reach the command
+  line.
+- =console== is optional and repeatable. With none, the kernel has no console:
+  on a carrier with no display that is indistinguishable from a kernel that
+  never started, so a headless board passes =--console ttyGS0,115200= (USB
+  serial) or =--console ttyAMA0,115200= (the header UART).
+
+* What fails in silence
+
+| symptom                                        | cause                                                    |
+|------------------------------------------------+----------------------------------------------------------|
+| board reboots into the previous kernel          | =config.txt= names a kernel the partition does not carry  |
+| nothing at all, not even firmware output        | no base device tree in the partition root                 |
+| board comes up without panel, audio or a USB port | overlay missing from =overlays/= or not requested       |
+| black screen after the firmware log             | =cmdline.txt= absent or without =root=                    |
+| initrd prints one line and opens a REPL         | =cmdline.txt= without =gnu.load=                          |
+| kernel never starts, firmware looks healthy     | firmware name does not match the kernel's page size       |
+| 32-bit firmware path                            | =arm_64bit= missing from =config.txt=                     |
+
+Every entry in that table is a file the tool writes. None of them produces an
+error message on the board, which is why the tool checks its inputs before it
+touches the partition and exits non-zero when one is missing.
+
+* Using the tool
+
+#+begin_src shell
+# mount the FAT partition of the card, then:
+sudo ./rpi-boot-populate /mnt/boot /gnu/store/<hash>-linux-rpi-4k-zstd-console \
+  --page-size 4k \
+  --initrd /gnu/store/<hash>-raw-initrd \
+  --console ttyGS0,115200
+#+end_src
+
+=--initrd= accepts the initrd store *directory* (the form the system's boot
+parameters name, holding exactly one file) or the file inside it.
+
+The kernel directory argument is the package's store output, the one that
+contains =Image= and =dtbs/=. The tool copies from it, writes =config.txt= and
+=cmdline.txt= from the template and its own arguments, and prints what it
+installed. A non-zero exit means nothing was reported ready: read the message,
+it names the file that is missing.

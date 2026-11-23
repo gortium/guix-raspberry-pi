@@ -1,0 +1,21 @@
+;;; examples/image-cm5 — the disk image for the Compute Module 5 reference
+;;; system (examples/system-cm5.scm).
+;;;
+;;; Build:  guix system image -L . examples/image-cm5
+;;; Flash:  dd to the card, then mount the FAT partition and run
+;;;         rpi-boot-populate against it — the image ships an empty boot
+;;;         partition on purpose (see rpi/image.scm).
+;;;
+;;; Nothing about the layout is decided here: sizes, offsets and labels come
+;;; from (rpi image), so a board that needs a different first sector changes an
+;;; argument instead of copying the builder.
+;;;
+;;; This is a module with a `define-module' form, like every other file under
+;;; this channel. `guix system image' loads it and takes the value of its last
+;;; expression; the channel compiler would reject a bare script here.
+
+(define-module (examples image-cm5)
+  #:use-module (examples system-cm5)
+  #:use-module (rpi image))
+
+(rpi-image #:os cm5-system)
