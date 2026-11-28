@@ -160,7 +160,12 @@ configuration in which the other name is correct.
 - =console== is optional and repeatable. With none, the kernel has no console:
   on a carrier with no display that is indistinguishable from a kernel that
   never started, so a headless board passes =--console ttyGS0,115200= (USB
-  serial) or =--console ttyAMA0,115200= (the header UART).
+  serial) or =--console ttyAMA0,115200= (the header UART). On a board that has
+  a display, pass =tty0= as well and pass it first: the framebuffer console
+  exists as soon as the kernel starts, while a USB serial console only appears
+  once its gadget modules are loaded and never appears at all if the boot dies
+  before them. A kernel that panics with no console prints nothing, and the
+  panel then shows the same empty screen as a kernel that is merely quiet.
 
 * What fails in silence
 
@@ -185,7 +190,7 @@ touches the partition and exits non-zero when one is missing.
 sudo ./rpi-boot-populate /mnt/boot /gnu/store/<hash>-linux-rpi-4k-zstd-console \
   --page-size 4k \
   --initrd /gnu/store/<hash>-raw-initrd \
-  --console ttyGS0,115200
+  --console tty0 --console ttyGS0,115200
 #+end_src
 
 =--initrd= accepts the initrd store *directory* (the form the system's boot

@@ -193,7 +193,7 @@ Flash the image, mount the FAT partition, and let the writer place the payload:
 sudo ./rpi-boot-populate /mnt/boot /gnu/store/<hash>-linux-rpi-4k-zstd-console \
   --page-size 4k \
   --initrd /gnu/store/<hash>-raw-initrd \
-  --console ttyGS0,115200
+  --console tty0 --console ttyGS0,115200
 #+end_src
 
 =--initrd= takes the initrd *store output*, which is a directory:
